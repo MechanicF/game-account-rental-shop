@@ -106,8 +106,218 @@ function backupDB(force) {
     return manual;
   } catch (e) { console.error('[shop] 备份失败:', e); return null; }
 }
+// [WebDAV] 生成新备份后触发异地同步（延迟异步，不阻塞启动/请求）
+function scheduleWebdavSync(){
+  const w = db && db.settings && db.settings.webdav;
+  if(!w || w.enabled === false || !w.url){ return; }
+  setTimeout(function(){ syncLatestToWebDAV().catch(function(e){ console.error('[shop] WebDAV 自动同步异常:', e && e.message); }); }, 800).unref();
+}
+// 在两处实际新建备份后插入触发
+(function patchBackupForWebdav(){
+  // 通过包装实现，避免改动 backupDB 主体逻辑
+  const orig = backupDB;
+  backupDB = function(force){
+    const dir = path.join(__dirname, 'data', 'backups');
+    let before = '';
+    try{ before = fs.readdirSync(dir).filter(x=>x.endsWith('.json')).sort().join('|'); }catch(e){}
+    const r = orig(force);
+    let after = '';
+    try{ after = fs.readdirSync(dir).filter(x=>x.endsWith('.json')).sort().join('|'); }catch(e){}
+    if(r && after !== before){ scheduleWebdavSync(); }
+    return r;
+  };
+})();
 backupDB();
 setInterval(() => { backupDB(); }, 3600 * 1000).unref();
+
+/* ---------------- WebDAV 异地备份（零依赖） ---------------- */
+const webdavState = { syncing: false };
+function webdavConfigFrom(src){
+  const w = (src && typeof src === 'object') ? src : {};
+  return {
+    enabled: w.enabled !== false,
+    url: String(w.url || '').trim().replace(/\/+$/, ''),
+    username: String(w.username || ''),
+    password: String(w.password || ''),
+    remoteDir: String(w.remoteDir || 'shop-backups').trim().replace(/^\/+|\/+$/g, '') || 'shop-backups'
+  };
+}
+function currentWebdavConfig(){ return webdavConfigFrom(db && db.settings && db.settings.webdav); }
+function webdavAuth(cfg){
+  if(!cfg.username && !cfg.password){ return {}; }
+  return { 'Authorization': 'Basic ' + Buffer.from(cfg.username + ':' + cfg.password).toString('base64') };
+}
+function webdavRequest(method, urlStr, headers, body, timeoutMs, redirects, maxBytes){
+  redirects = redirects || 0;
+  maxBytes = maxBytes || 2 * 1024 * 1024; // 默认响应体上限 2MB；下载备份时传更大值
+  return new Promise((resolve, reject) => {
+    let u;
+    try{ u = new URL(urlStr); }catch(e){ return reject(new Error('WebDAV 地址不合法')); }
+    if(u.protocol !== 'http:' && u.protocol !== 'https:'){ return reject(new Error('WebDAV 仅支持 http/https')); }
+    const mod = u.protocol === 'https:' ? require('node:https') : require('node:http');
+    const req = mod.request({
+      method, hostname: u.hostname, port: u.port || undefined,
+      path: u.pathname + (u.search || ''),
+      headers: headers || {}, timeout: timeoutMs || 15000
+    }, res => {
+      // 跟随 3xx 重定向（如 /dav → /dav/），保留认证头，最多 5 跳，防循环
+      if(res.statusCode >= 300 && res.statusCode < 400 && res.headers.location){
+        res.resume();
+        if(redirects >= 5){ return reject(new Error('WebDAV 重定向次数过多')); }
+        let next;
+        try{ next = new URL(res.headers.location, urlStr).toString(); }catch(e){ return reject(new Error('重定向地址无效')); }
+        return webdavRequest(method, next, headers, body, timeoutMs, redirects + 1, maxBytes).then(resolve, reject);
+      }
+      const chunks = [];
+      let n = 0, overflow = false;
+      res.on('data', c => { n += c.length; if(n > maxBytes){ overflow = true; req.destroy(); } else { chunks.push(c); } });
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+      res.on('error', () => { if(overflow){ return reject(new Error('响应内容过大')); } });
+    });
+    req.on('timeout', () => req.destroy(new Error('WebDAV 请求超时')));
+    req.on('error', reject);
+    if(body){ req.write(body); }
+    req.end();
+  });
+}
+function webdavRemoteBase(cfg){
+  return cfg.url + '/' + cfg.remoteDir.split('/').map(encodeURIComponent).join('/');
+}
+async function webdavEnsureDir(cfg){
+  if(!cfg.url){ throw new Error('未配置 WebDAV 地址'); }
+  // 逐级 MKCOL；201=创建成功，405/207/409=已存在或父级问题，继续尝试
+  let cur = cfg.url;
+  for(const part of cfg.remoteDir.split('/').filter(Boolean)){
+    cur += '/' + encodeURIComponent(part);
+    try{ await webdavRequest('MKCOL', cur, webdavAuth(cfg), null, 12000); }catch(e){}
+  }
+}
+async function webdavPut(cfg, fileName, data, contentType){
+  const url = webdavRemoteBase(cfg) + '/' + encodeURIComponent(fileName);
+  const headers = Object.assign({ 'Content-Type': contentType || 'application/octet-stream', 'Content-Length': data.length }, webdavAuth(cfg));
+  const r = await webdavRequest('PUT', url, headers, data, 40000);
+  if(r.status < 200 || r.status >= 300){ throw new Error('上传失败（HTTP ' + r.status + '）'); }
+  return url;
+}
+function webdavSetStatus(ok, msg){
+  if(!db.settings.webdav){ db.settings.webdav = {}; }
+  db.settings.webdav.lastSyncAt = Date.now();
+  db.settings.webdav.lastSyncOk = !!ok;
+  db.settings.webdav.lastSyncMsg = String(msg || '').slice(0, 200);
+  saveDB();
+}
+async function syncLatestToWebDAV(force){
+  const cfg = currentWebdavConfig();
+  if(!cfg.enabled || !cfg.url){ return { ok:false, msg:'未启用或未配置 WebDAV' }; }
+  if(webdavState.syncing && !force){ return { ok:false, msg:'正在同步中，请稍候' }; }
+  webdavState.syncing = true;
+  try{
+    const dir = path.join(__dirname, 'data', 'backups');
+    const files = fs.readdirSync(dir).filter(f => /^db-.*\.json$/.test(f));
+    if(!files.length){ throw new Error('没有可上传的备份文件'); }
+    // 按文件名内嵌的日期时间选最新（db-YYYYMMDD 或 db-manual-YYYYMMDD-HHMMSS），
+    // 不依赖文件 mtime（解压/同步会重置 mtime，不可靠）
+    function stampOf(f){
+      const m = String(f).match(/(\d{8})(?:-(\d{6}))?/);
+      return m ? (m[1] + (m[2] || '000000')) : '';
+    }
+    files.sort(function(a,b){
+      const sa = stampOf(a), sb = stampOf(b);
+      if(sa !== sb){ return sa > sb ? -1 : 1; }
+      // 同日：优先每日快照(db-)而非手动快照(db-manual-)，二者内容同源时每日快照更规范
+      const da = a.indexOf('db-manual-') === 0 ? 1 : 0;
+      const db2 = b.indexOf('db-manual-') === 0 ? 1 : 0;
+      return da - db2;
+    });
+    const latest = files[0];
+    await webdavEnsureDir(cfg);
+    await webdavPut(cfg, latest, fs.readFileSync(path.join(dir, latest)), 'application/json');
+    webdavSetStatus(true, latest);
+    console.log('[shop] WebDAV 备份成功:', latest);
+    return { ok:true, msg:'已上传 ' + latest, file: latest };
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e);
+    webdavSetStatus(false, msg);
+    console.error('[shop] WebDAV 备份失败:', msg);
+    return { ok:false, msg: msg };
+  }finally{
+    webdavState.syncing = false;
+  }
+}
+async function webdavTestConnection(testCfg){
+  const cfg = webdavConfigFrom(testCfg);
+  if(!cfg.url){ throw new Error('请填写 WebDAV 地址'); }
+  await webdavEnsureDir(cfg);
+  const probe = '__shop_probe_' + Date.now() + '.txt';
+  await webdavPut(cfg, probe, Buffer.from('webdav connectivity test'), 'text/plain');
+  // 尽力删除探针文件（失败不影响测试结果）
+  try{ await webdavRequest('DELETE', webdavRemoteBase(cfg) + '/' + probe, webdavAuth(cfg), null, 10000); }catch(e){}
+  return true;
+}
+// 列出 WebDAV 远程目录中的备份文件（PROPFIND Depth:1，解析 XML）
+async function webdavListBackups(){
+  const cfg = currentWebdavConfig();
+  if(!cfg.url){ throw new Error('未配置 WebDAV 地址'); }
+  const headers = Object.assign({ 'Depth': '1' }, webdavAuth(cfg));
+  const r = await webdavRequest('PROPFIND', webdavRemoteBase(cfg) + '/', headers, null, 25000);
+  if(r.status !== 207 && r.status !== 200){ throw new Error('列目录失败（HTTP ' + r.status + '）'); }
+  const xml = r.body.toString('utf8');
+  const files = [];
+  // WebDAV multistatus: 每个 <response> 含 href / getcontentlength / getlastmodified
+  const respRe = /<(?:[\w-]+:)?response\b[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?response>/gi;
+  let m;
+  while((m = respRe.exec(xml)) !== null){
+    const block = m[1];
+    const hm = block.match(/<(?:[\w-]+:)?href\b[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?href>/i);
+    if(!hm){ continue; }
+    let href = hm[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim();
+    let name;
+    try{ name = decodeURIComponent(new URL(href, cfg.url + '/').pathname).split('/').pop(); }catch(e){ name = href.split('/').pop(); }
+    if(!/^db-.*\.json$/i.test(name)){ continue; } // 只列备份 json
+    const cm = block.match(/<(?:[\w-]+:)?getcontentlength\b[^>]*>(\d+)<\/(?:[\w-]+:)?getcontentlength>/i);
+    const lm = block.match(/<(?:[\w-]+:)?getlastmodified\b[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?getlastmodified>/i);
+    let mtime = 0;
+    if(lm){ const t = Date.parse(lm[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim()); if(!isNaN(t)){ mtime = t; } }
+    // 文件名内日期戳作为后备排序依据
+    const sm = name.match(/(\d{8})(?:-(\d{6}))?/);
+    const stamp = sm ? (sm[1] + (sm[2] || '000000')) : '';
+    files.push({ name: name, size: cm ? parseInt(cm[1], 10) : 0, mtime: mtime, stamp: stamp });
+  }
+  files.sort(function(a,b){
+    if(a.mtime && b.mtime && a.mtime !== b.mtime){ return b.mtime - a.mtime; }
+    return a.stamp > b.stamp ? -1 : (a.stamp < b.stamp ? 1 : 0);
+  });
+  return files;
+}
+// 从 WebDAV 下载指定备份文件内容（返回 Buffer）
+async function webdavDownloadBackup(name){
+  const cfg = currentWebdavConfig();
+  if(!cfg.url){ throw new Error('未配置 WebDAV 地址'); }
+  // [安全] 严格校验文件名，防路径穿越
+  if(!/^db-[A-Za-z0-9_.-]+\.json$/i.test(name)){ throw new Error('备份文件名不合法'); }
+  const url = webdavRemoteBase(cfg) + '/' + encodeURIComponent(name);
+  const r = await webdavRequest('GET', url, webdavAuth(cfg), null, 90000, 0, 100 * 1024 * 1024);
+  if(r.status < 200 || r.status >= 300){ throw new Error('下载失败（HTTP ' + r.status + '）'); }
+  return r.body;
+}
+// 恢复数据的统一实现（本地上传恢复与 WebDAV 恢复共用），恢复前自动留本地快照
+function applyRestorePayload(b){
+  if (!b || typeof b !== 'object' || !Array.isArray(b.products)){ return { ok:false, msg:'备份文件缺少商品数据' }; }
+  backupDB(true); // 恢复前留快照
+  const prods = [];
+  for (const x of b.products) {
+    if (!x || typeof x !== 'object' || !x.id || !x.name) continue;
+    prods.push({ id: cleanStr(x.id, 40), name: cleanStr(x.name, 60), fields: cleanFields(x.fields), image: cleanImage(x.image), status: x.status === 'off' ? 'off' : 'on', createdAt: Number(x.createdAt) || Date.now(), pinned: !!x.pinned, highlight: !!x.highlight });
+    if (prods.length >= 3000) break;
+  }
+  db.products = prods;
+  db.settings = cleanRestoredSettings(db.settings || {}, b.settings);
+  db.pending = cleanRestoredPending(b.pending, db.pending);
+  if (!db.settings.adminPath) db.settings.adminPath = genAdminPath();
+  saveDB();
+  console.log('[shop] 数据已恢复，商品数:', prods.length);
+  return { ok:true, msg:'数据已恢复', products: prods.length };
+}
 
 /* ---------------- 会话与密码 ---------------- */
 const sessions = new Map(); // token -> { exp }
@@ -364,11 +574,27 @@ function cleanRestoredSettings(cur, inc) {
     const agr = (inc.agreement && typeof inc.agreement === 'object') ? inc.agreement : {};
     out.agreement = { enabled: agr.enabled !== false, title: cleanStr(agr.title, 50), content: cleanStr(agr.content, 4000) };
   }
+  if (inc.webdav !== undefined) {
+    const prevW = (cur.webdav && typeof cur.webdav === 'object') ? cur.webdav : {};
+    const wd = (inc.webdav && typeof inc.webdav === 'object') ? inc.webdav : {};
+    out.webdav = {
+      enabled: wd.enabled !== false,
+      url: cleanStr(wd.url, 500).replace(/\/+$/, ''),
+      username: cleanStr(wd.username, 200),
+      // [安全] 密码不允许被备份文件覆盖为空时清除原密码；留空则沿用
+      password: cleanStr(wd.password, 300) || String(prevW.password || ''),
+      remoteDir: (cleanStr(wd.remoteDir, 200).replace(/^\/+|\/+$/g, '') || 'shop-backups'),
+      lastSyncAt: Number(wd.lastSyncAt) || 0,
+      lastSyncOk: !!wd.lastSyncOk,
+      lastSyncMsg: cleanStr(wd.lastSyncMsg, 200)
+    };
+  }
   if (!out.adminPath) out.adminPath = genAdminPath();
   return out;
 }
 function publicSettings() {
   const s = db.settings || {};
+  // [安全] webdav 含敏感凭据，绝不放进公开接口
   return { storeName: s.storeName || '游戏账号租赁', contact: s.contact || '', copyTemplate: s.copyTemplate || '编号：{id}（{name}）', filters: Array.isArray(s.filters) ? s.filters : null, productFields: Array.isArray(s.productFields) ? s.productFields : null, cs: (s.cs && typeof s.cs === 'object') ? s.cs : null, popup: (s.popup && typeof s.popup === 'object') ? s.popup : null, agreement: (s.agreement && typeof s.agreement === 'object') ? s.agreement : null };
 }
 function statePayload() {
@@ -377,7 +603,15 @@ function statePayload() {
   var products = (db.products || []).map(function(p){
     return Object.assign({}, p, { total: calcTotalServer(p) });
   });
-  return { ok: true, mustChangePassword: !db.admin, settings: db.settings || {}, products: products, pending: db.pending || [] };
+  // [安全] 下发的 settings 中 webdav 密码脱敏：仅告知是否已设置，不返回明文
+  var settings = Object.assign({}, db.settings || {});
+  if (settings.webdav && typeof settings.webdav === 'object'){
+    var wd = Object.assign({}, settings.webdav);
+    wd.hasPassword = !!wd.password;
+    delete wd.password;
+    settings.webdav = wd;
+  }
+  return { ok: true, mustChangePassword: !db.admin, settings: settings, products: products, pending: db.pending || [] };
 }
 function padId(n) { return String(n).padStart(4, '0'); }
 function nextProductId() {
@@ -500,8 +734,51 @@ async function apiRoute(req, res, u, p) {
           content: cleanStr(agr.content, 4000)
         };
       }
+      if (b.webdav !== undefined) {
+        var wd = (b.webdav && typeof b.webdav === 'object') ? b.webdav : {};
+        var prevW = (db.settings.webdav && typeof db.settings.webdav === 'object') ? db.settings.webdav : {};
+        var newPwd = String(wd.password || '');
+        // [安全] 密码留空表示保持原值（前端拿到的是脱敏态，不能回传明文）
+        db.settings.webdav = {
+          enabled: wd.enabled !== false,
+          url: cleanStr(wd.url, 500).replace(/\/+$/, ''),
+          username: cleanStr(wd.username, 200),
+          password: newPwd ? newPwd.slice(0, 300) : String(prevW.password || ''),
+          remoteDir: (cleanStr(wd.remoteDir, 200).replace(/^\/+|\/+$/g, '') || 'shop-backups'),
+          lastSyncAt: Number(prevW.lastSyncAt) || 0,
+          lastSyncOk: !!prevW.lastSyncOk,
+          lastSyncMsg: String(prevW.lastSyncMsg || '')
+        };
+      }
       saveDB();
       return sendJSON(res, req, 200, { ok: true });
+    });
+  }
+
+  if (method === 'POST' && p === '/api/admin/webdav/test') {
+    return authRoute(req, res, async () => {
+      let b;
+      try { b = JSON.parse(await readBody(req) || '{}'); } catch (e) { return sendJSON(res, req, 400, { ok: false, msg: '请求格式错误' }); }
+      // 密码留空时用已保存的（脱敏状态下前端拿不到明文）
+      var savedW = (db.settings && db.settings.webdav) || {};
+      var testCfg = {
+        url: b.url !== undefined ? b.url : savedW.url,
+        username: b.username !== undefined ? b.username : savedW.username,
+        password: (b.password !== undefined && String(b.password)) ? b.password : savedW.password,
+        remoteDir: b.remoteDir !== undefined ? b.remoteDir : savedW.remoteDir
+      };
+      try {
+        await webdavTestConnection(testCfg);
+        return sendJSON(res, req, 200, { ok: true, msg: '连接成功，写入测试通过 ✅' });
+      } catch (e) {
+        return sendJSON(res, req, 200, { ok: false, msg: '连接失败：' + ((e && e.message) || String(e)) });
+      }
+    });
+  }
+  if (method === 'POST' && p === '/api/admin/webdav/sync') {
+    return authRoute(req, res, async () => {
+      var r = await syncLatestToWebDAV(true);
+      return sendJSON(res, req, r.ok ? 200 : 500, r);
     });
   }
 
@@ -645,21 +922,63 @@ async function apiRoute(req, res, u, p) {
     return authRoute(req, res, async () => {
       let b;
       try { b = JSON.parse(await readBody(req) || '{}'); } catch (e) { return sendJSON(res, req, 400, { ok: false, msg: '备份文件格式错误' }); }
-      if (!b || typeof b !== 'object' || !Array.isArray(b.products)) return sendJSON(res, req, 400, { ok: false, msg: '备份文件缺少商品数据' });
-      backupDB(true);
-      const prods = [];
-      for (const x of b.products) {
-        if (!x || typeof x !== 'object' || !x.id || !x.name) continue;
-        prods.push({ id: cleanStr(x.id, 40), name: cleanStr(x.name, 60), fields: cleanFields(x.fields), image: cleanImage(x.image), status: x.status === 'off' ? 'off' : 'on', createdAt: Number(x.createdAt) || Date.now(), pinned: !!x.pinned, highlight: !!x.highlight });
-        if (prods.length >= 3000) break;
+      var result = applyRestorePayload(b);
+      if(!result.ok){ return sendJSON(res, req, 400, result); }
+      return sendJSON(res, req, 200, result);
+    });
+  }
+  // WebDAV：列出远程备份版本
+  if (method === 'GET' && p === '/api/admin/webdav/backups') {
+    return authRoute(req, res, async () => {
+      try{
+        var files = await webdavListBackups();
+        return sendJSON(res, req, 200, { ok: true, files: files });
+      }catch(e){
+        return sendJSON(res, req, 200, { ok: false, msg: (e && e.message) || String(e) });
       }
-      db.products = prods;
-      db.settings = cleanRestoredSettings(db.settings || {}, b.settings);
-      db.pending = cleanRestoredPending(b.pending, db.pending);
-      if (!db.settings.adminPath) db.settings.adminPath = genAdminPath();
-      saveDB();
-      console.log('[shop] 已从备份恢复数据');
-      return sendJSON(res, req, 200, { ok: true, msg: '数据已恢复' });
+    });
+  }
+  // WebDAV：下载指定版本到本地 backups/ 目录（不恢复）
+  if (method === 'POST' && p === '/api/admin/webdav/download') {
+    return authRoute(req, res, async () => {
+      let b;
+      try { b = JSON.parse(await readBody(req) || '{}'); } catch (e) { return sendJSON(res, req, 400, { ok: false, msg: '请求格式错误' }); }
+      var name = String(b.name || '');
+      try{
+        var buf = await webdavDownloadBackup(name);
+        // 校验是否为有效备份 JSON
+        var parsed;
+        try{ parsed = JSON.parse(buf.toString('utf8')); }catch(e){ throw new Error('下载内容不是有效 JSON'); }
+        if(!parsed || !Array.isArray(parsed.products)){ throw new Error('下载内容不是有效备份（缺少商品数据）'); }
+        // 安全落盘：固定目录 + 文件名白名单
+        var dir = path.join(__dirname, 'data', 'backups');
+        fs.mkdirSync(dir, { recursive: true });
+        var localName = 'db-webdav-' + name.replace(/^db-/, '');
+        fs.writeFileSync(path.join(dir, localName), buf);
+        console.log('[shop] WebDAV 备份已下载到本地:', localName);
+        return sendJSON(res, req, 200, { ok: true, msg: '已下载到本地', name: localName, products: parsed.products.length, size: buf.length });
+      }catch(e){
+        return sendJSON(res, req, 200, { ok: false, msg: (e && e.message) || String(e) });
+      }
+    });
+  }
+  // WebDAV：下载指定版本并恢复（恢复前自动留本地快照）
+  if (method === 'POST' && p === '/api/admin/webdav/restore') {
+    return authRoute(req, res, async () => {
+      let b;
+      try { b = JSON.parse(await readBody(req) || '{}'); } catch (e) { return sendJSON(res, req, 400, { ok: false, msg: '请求格式错误' }); }
+      var name = String(b.name || '');
+      try{
+        var buf = await webdavDownloadBackup(name);
+        var parsed;
+        try{ parsed = JSON.parse(buf.toString('utf8')); }catch(e){ throw new Error('备份内容不是有效 JSON'); }
+        var result = applyRestorePayload(parsed); // 内部会 backupDB(true) 留快照
+        if(!result.ok){ throw new Error(result.msg || '恢复失败'); }
+        console.log('[shop] 已从 WebDAV 备份恢复数据:', name);
+        return sendJSON(res, req, 200, { ok: true, msg: '已从「' + name + '」恢复数据', products: db.products.length });
+      }catch(e){
+        return sendJSON(res, req, 200, { ok: false, msg: (e && e.message) || String(e) });
+      }
     });
   }
 
