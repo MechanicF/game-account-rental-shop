@@ -1,0 +1,22 @@
+# 运行数据与备份（含客户资料/管理员凭据，禁止入库）
+/data/
+/data/db.json
+/data/db.json.tmp
+/data/db.json.bak
+/data/backups/
+
+# 密钥与本地配置
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_key
+ssh_keys/
+.ssh_keys/
+
+# 依赖与系统文件
+node_modules/
+.DS_Store
+Thumbs.db
+*.log

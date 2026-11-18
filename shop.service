@@ -1,0 +1,23 @@
+[Unit]
+Description=Game Account Rental Shop
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/shop
+# 用绝对路径启动；不依赖 npm（服务器未安装 npm，项目零依赖）
+ExecStart=/usr/bin/node /opt/shop/server.js
+Environment=PORT=3000
+Environment=HOST=0.0.0.0
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shop
+
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

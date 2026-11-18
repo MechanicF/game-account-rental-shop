@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="游戏账号租赁店铺，前台浏览、筛选和自助上架。">
+<meta property="og:type" content="website">
+<meta property="og:title" content="游戏账号租赁">
+<meta property="og:description" content="游戏账号租赁店铺，前台浏览、筛选和自助上架。">
+<meta name="theme-color" content="#0a0e16">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%AE%3C/text%3E%3C/svg%3E">
+<title>游戏账号租赁</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<script>try{document.body.classList.add(localStorage.getItem('shop_theme')==='dark'?'dark':'light');}catch(e){document.body.classList.add('light');}</script>
+
+<!-- ============ 前台 ============ -->
+<header class="site-header">
+  <div class="header-inner">
+    <div class="logo"><span class="logo-icon">🎮</span><span id="headerStore">游戏账号租赁</span></div>
+    <span class="contact-chip" id="headerContact" hidden></span>
+  </div>
+</header>
+
+<main class="container">
+  <noscript><p style="text-align:center;color:#98a2b8;padding:20px 0;">请开启 JavaScript 才能浏览商品。</p></noscript>
+  <div class="rotate-tip" id="rotateTip" hidden>📱 建议将手机横屏浏览，展示效果更佳</div>
+
+  <section class="hero">
+    <h1 id="heroTitle">游戏账号租赁</h1>
+    <p class="hero-sub">看中哪个号？点「复制编号」发给店主，快速租号 👇</p>
+    <div class="hero-stats" id="heroStats"></div>
+    <div class="hero-cta">
+      <button type="button" class="btn btn-primary" id="applyBtn">📤 自助上架（提交后店主审核展示）</button>
+    </div>
+  </section>
+
+  <div class="toolbar" role="search">
+    <input id="searchInput" type="search" aria-label="搜索商品" placeholder="🔍 搜索昵称 / 段位 / 皮肤…">
+    <button type="button" class="search-clear" id="searchClear" aria-label="清除搜索" hidden>✕</button>
+  </div>
+
+  <div class="grid" id="productGrid"></div>
+
+  <div class="empty-state" id="emptyState" hidden>
+    <div class="empty-icon">🏪</div>
+    <p id="emptyMsg">店主暂未上架商品，请稍后再来看看～</p>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <p id="footerContact"></p>
+  <p class="footer-note">本页仅展示账号信息，租用前请与店主确认</p>
+</footer>
+
+<!-- ============ 登录弹窗 ============ -->
+<div class="modal-back" id="loginModal" hidden>
+  <div class="modal-card">
+    <h3>🔐 后台登录</h3>
+    <input id="loginUser" type="text" placeholder="用户名" autocomplete="username">
+    <input id="loginPass" type="password" placeholder="密码" autocomplete="current-password">
+    <button type="button" class="btn btn-primary block" id="loginBtn">登 录</button>
+  </div>
+</div>
+
+<!-- ============ 自助上架弹窗 ============ -->
+<div class="modal-back" id="applyModal" hidden>
+  <div class="modal-card apply">
+    <div id="applyFormWrap">
+      <h3>📤 自助上架</h3>
+      <p class="hint" style="margin:0 0 18px">填写账号信息提交给店主，<b>审核通过后</b>才会在店铺展示</p>
+      <form id="applyForm" novalidate>
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="a_name">游戏昵称 <span class="req">*</span></label>
+            <input id="a_name" type="text" placeholder="必填，如：云边的兔">
+          </div>
+          <div class="form-group">
+            <label for="a_contact">你的联系方式 <span class="req">*</span></label>
+            <input id="a_contact" type="text" placeholder="微信 / QQ / 电话，店主审核时联系你">
+          </div>
+        </div>
+
+        <div class="form-grid" id="applyFields"></div>
+
+        <div class="form-group img-group">
+          <label>账号截图（选填）</label>
+          <div class="img-box">
+            <div class="img-preview">
+              <img id="applyImgPreview" alt="预览" style="display:none">
+              <span class="img-ph" id="applyImgPh">🎮</span>
+            </div>
+            <div class="img-ctrl">
+              <input type="file" id="applyImgFile" accept="image/*" hidden>
+              <button type="button" class="btn small" id="applyImgPick">📁 选择截图</button>
+              <div class="img-url-row">
+                <input id="applyImgUrl" type="text" placeholder="或粘贴图片链接（http…）">
+                <button type="button" class="btn small ghost" id="applyImgUrlBtn">使用链接</button>
+              </div>
+              <button type="button" class="btn small danger" id="applyImgClear">移除图片</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <span class="form-hint">提交即表示同意由店主审核后展示</span>
+          <div>
+            <button type="button" class="btn ghost" id="applyCancel">取消</button>
+            <button type="submit" class="btn btn-primary" id="applySubmitBtn">🚀 提交上架申请</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <div id="applyResult" hidden>
+      <div class="apply-result">
+        <div class="big">✅</div>
+        <h3>申请已提交</h3>
+        <p class="hint">店主审核通过后就会在店铺展示。<br><span id="applyContactHint"></span></p>
+        <div style="margin-top:18px"><button type="button" class="btn btn-primary" id="applyClose">好的</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 后台登录页（仅入口路径显示） ============ -->
+<div id="adminLoginView" hidden>
+  
+  <div class="alogin-card">
+    <div class="alogin-logo">🎮</div>
+    <h2 id="aloginTitle">游戏账号租赁</h2>
+    <p class="alogin-sub">后台管理 · 请登录</p>
+    <input id="aUser" type="text" placeholder="用户名" autocomplete="username">
+    <input id="aPass" type="password" placeholder="密码" autocomplete="current-password">
+    <button type="button" class="btn btn-primary block" id="aLoginBtn">登 录</button>
+    <p class="alogin-hint" id="aloginHint"></p>
+    <a class="alogin-back" href="/">← 返回店铺首页</a>
+  </div>
+</div>
+
+<!-- ============ 后台面板 ============ -->
+<div id="adminPanel" hidden>
+  <header class="admin-top">
+    <button type="button" class="btn small ghost" id="adminBack">← 返回前台</button>
+    <h2>🛠️ 后台管理</h2>
+    <button type="button" class="btn small ghost" id="adminLogout">退出登录</button>
+  </header>
+
+  <nav class="admin-tabs">
+    <button type="button" class="tab active" id="tab-list">📦 商品管理</button>
+    <button type="button" class="tab" id="tab-pending">📥 待审核<span class="badge" id="pendingBadge" hidden></span></button>
+    <button type="button" class="tab" id="tab-form">➕ 新增商品</button>
+    <button type="button" class="tab" id="tab-settings">⚙️ 设置</button>
+  </nav>
+
+  <main class="admin-main">
+    <!-- 商品管理 -->
+    <section id="view-list">
+      <div class="admin-stats" id="adminStats"></div>
+      <div class="toolbar" role="search">
+        <input id="adminSearch" type="search" aria-label="搜索后台商品" placeholder="🔍 搜索编号 / 昵称 / 字段…">
+        <button type="button" class="search-clear" id="adminSearchClear" aria-label="清除后台搜索" hidden>✕</button>
+      </div>
+      <div id="adminList"></div>
+    </section>
+
+    <!-- 待审核 -->
+    <section id="view-pending" hidden>
+      <div class="admin-stats" id="pendingStats"></div>
+      <div id="pendingList"></div>
+    </section>
+
+    <!-- 新增 / 编辑商品 -->
+    <section id="view-form" hidden>
+      <form id="productForm" novalidate>
+        <h3 id="formTitle">新增商品</h3>
+
+        <div class="form-group wide" style="margin-bottom:16px">
+          <label for="f_name">游戏昵称 <span class="req">*</span></label>
+          <input id="f_name" type="text" placeholder="必填，如：云边的兔">
+        </div>
+
+        <div class="form-grid" id="formFields"></div>
+
+        <div class="form-group img-group">
+          <label>商品图片（选填）</label>
+          <div class="img-box">
+            <div class="img-preview">
+              <img id="imgPreview" alt="预览" style="display:none">
+              <span class="img-ph" id="imgPh">🎮</span>
+            </div>
+            <div class="img-ctrl">
+              <input type="file" id="imgFile" accept="image/*" hidden>
+              <button type="button" class="btn small" id="imgPick">📁 选择本地图片</button>
+              <div class="img-url-row">
+                <input id="imgUrl" type="text" placeholder="或粘贴图片链接（http…）">
+                <button type="button" class="btn small ghost" id="imgUrlBtn">使用链接</button>
+              </div>
+              <button type="button" class="btn small danger" id="imgClear">移除图片</button>
+            </div>
+          </div>
+          <p class="form-hint">本地图片会自动压缩后上传。建议每张图 200KB 以内，加载更快。</p>
+        </div>
+
+        <div class="form-actions">
+          <label class="check-line"><input type="checkbox" id="f_status" checked> 保存后立即上架</label>
+          <label class="check-line"><input type="checkbox" id="f_pinned"> 📌 置顶（前台排最前）</label>
+          <label class="check-line"><input type="checkbox" id="f_highlight"> ⭐ 高亮（金色边框）</label>
+          <div>
+            <button type="button" class="btn ghost" id="formBack">取消</button>
+            <button type="submit" class="btn btn-primary">💾 保存商品</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <!-- 设置 -->
+    <section id="view-settings" hidden>
+      <div class="set-card">
+        <h4>🏪 店铺信息</h4>
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="setStoreName">店铺名称</label>
+            <input id="setStoreName" type="text" placeholder="显示在前台顶部，如：三角洲租号小店">
+          </div>
+          <div class="form-group">
+            <label for="setContact">店主联系方式</label>
+            <input id="setContact" type="text" placeholder="如：微信 xxx / 电话 138…（前台页眉页脚展示）">
+          </div>
+          <div class="form-group wide">
+            <label for="setCopyTemplate">「复制编号」的文案格式</label>
+            <input id="setCopyTemplate" type="text" placeholder="编号：{id}（{name}）">
+            <p class="form-hint">可用占位符：{id} = 编号，{name} = 昵称</p>
+          </div>
+          <div class="form-group wide">
+            <label for="setAdminPath">🔐 后台入口路径（保密，勿外传）</label>
+            <div class="img-url-row" style="gap:8px">
+              <input id="setAdminPath" type="text" placeholder="如：admin_k3f9x2">
+              <button type="button" class="btn small ghost" id="setAdminPathRand">🎲 随机生成</button>
+            </div>
+            <p class="form-hint" id="adminPathHint"></p>
+          </div>
+        </div>
+        <button type="button" class="btn btn-primary" id="setSave">💾 保存设置</button>
+      </div>
+
+      <div class="set-card">
+        <h4>🔑 账号密码</h4>
+        <div class="form-grid">
+          <div class="form-group"><label for="newUser">新用户名（留空则不改；至少 2 位，不能含空格）</label><input id="newUser" type="text" placeholder="留空表示不修改用户名" autocomplete="username"></div>
+          <div class="form-group"><label for="oldPass">原密码</label><input id="oldPass" type="password" autocomplete="current-password"></div>
+          <div class="form-group"><label for="newPass">新密码（至少 6 位）</label><input id="newPass" type="password" autocomplete="new-password"></div>
+          <div class="form-group"><label for="newPass2">确认新密码</label><input id="newPass2" type="password" autocomplete="new-password"></div>
+        </div>
+        <p class="form-hint">用户名、密码可同时改或只改一项。修改用户名后，下次登录请用新用户名。</p>
+        <button type="button" class="btn btn-primary" id="passSave">保存修改</button>
+      </div>
+
+      <div class="set-card">
+        <h4>📦 数据备份</h4>
+        <div class="btn-row">
+          <button type="button" class="btn btn-primary" id="backupDownload">⬇️ 下载备份文件</button>
+          <button type="button" class="btn ghost" id="backupRestoreBtn">📂 从备份恢复</button>
+          <input type="file" id="backupFile" accept="application/json,.json" hidden>
+        </div>
+        <p class="form-hint">备份包含：全部设置、商品（含已下架）、待审核申请。下载的备份文件请妥善保存（可存网盘/电脑）；恢复会用备份内容覆盖当前数据，恢复前服务器会自动再留一份快照。</p>
+        
+        <div id="backupList"><p class="form-hint">加载中…</p></div>
+      </div>
+
+      <div class="set-card">
+        <h4>📖 使用说明</h4>
+        <ol class="usage-list">
+          <li>商品的新增、编辑、上架/下架<b>保存后前台立即生效</b>，无需再导出文件；</li>
+          <li>客户点「📤 自助上架」提交后，申请会直接出现在「📥 待审核」，点「✅ 通过」自动上架；</li>
+          <li>所有数据保存在服务器上，任何设备打开网页看到的是同一份数据；</li>
+          <li>服务器数据备份方法见《部署说明.md》（复制 data/db.json 即可）；</li>
+          <li>上线后请立即修改默认密码，并保管好 VPS 登录信息。</li>
+        </ol>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script src="/app.js"></script><script src="/adapt.js"></script>
+</body>
+</html>
